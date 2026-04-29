@@ -18,7 +18,7 @@ import config
 
 
 FEED_API_KEYWORD = "pgc/feed"
-SQUARE_URL = "https://www.binance.com/en/square"
+SQUARE_URL = "https://www.binance.com/zh-CN/square"
 USER_DATA_DIR = Path(__file__).parent / "user_data"
 
 

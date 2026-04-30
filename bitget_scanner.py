@@ -43,6 +43,16 @@ def log(message):
         handle.write(f"{line}\n")
 
 
+def render_progress(prefix, current, total, width=24):
+    total = max(total, 1)
+    current = max(0, min(current, total))
+    filled = int(width * current / total)
+    bar = "#" * filled + "-" * (width - filled)
+    print(f"\r[{now_str()}] {prefix} [{bar}] {current}/{total}", end="", flush=True)
+    if current >= total:
+        print()
+
+
 def load_json(path, default):
     if not os.path.exists(path):
         return copy.deepcopy(default)
@@ -229,7 +239,9 @@ def get_all_tickers():
 def get_funding_rates(tickers=None):
     tickers = tickers if isinstance(tickers, list) else get_all_tickers()
     funding_rates = {}
-    for ticker in tickers:
+    total = len(tickers)
+    for index, ticker in enumerate(tickers, start=1):
+        render_progress("获取资金费率", index, total)
         symbol = ticker.get("symbol")
         bitget_symbol = to_bitget_symbol(symbol)
         if not bitget_symbol:
@@ -739,7 +751,72 @@ def execute_open(data, state, symbol, price, signal):
     return trade
 
 
+def swap_weakest(data, state, open_trades, new_signal, ticker_map):
+    worst_trade = None
+    worst_pnl = float("inf")
+    worst_price = None
+
+    for trade in open_trades:
+        symbol = normalize_symbol(trade.get("symbol"))
+        ticker = ticker_map.get(symbol)
+        if not isinstance(ticker, dict):
+            continue
+        try:
+            current_price = float(ticker.get("lastPrice"))
+            entry_price = float(trade.get("entry_price"))
+            leverage = float(trade.get("leverage", LEVERAGE))
+        except (TypeError, ValueError):
+            continue
+        if current_price <= 0 or entry_price <= 0:
+            continue
+
+        direction = trade.get("direction")
+        if direction == "long":
+            pnl_pct = (current_price - entry_price) / entry_price * 100
+        elif direction == "short":
+            pnl_pct = (entry_price - current_price) / entry_price * 100
+        else:
+            continue
+
+        if pnl_pct < worst_pnl:
+            worst_pnl = pnl_pct
+            worst_trade = trade
+            worst_price = current_price
+
+    if worst_trade is None or worst_price is None:
+        log(f"满仓但未找到可换仓持仓，放弃信号 {new_signal.get('symbol')}")
+        return None
+    if worst_pnl > 0:
+        log(f"满仓但所有持仓盈利，不换仓，放弃信号 {new_signal.get('symbol')}")
+        return None
+
+    direction = worst_trade.get("direction")
+    leverage = float(worst_trade.get("leverage", LEVERAGE))
+    entry_price = float(worst_trade.get("entry_price"))
+    position_usd = float(worst_trade.get("position_usd", 0))
+    if direction == "long":
+        pnl_pct_lev = (worst_price - entry_price) / entry_price * 100 * leverage
+    else:
+        pnl_pct_lev = (entry_price - worst_price) / entry_price * 100 * leverage
+    pnl_usd = round(pnl_pct_lev / 100 * position_usd, 4)
+
+    worst_trade["exit_price"] = worst_price
+    worst_trade["exit_time"] = now_str()
+    worst_trade["exit_reason"] = f"换仓->{new_signal.get('symbol')}"
+    worst_trade["pnl_pct"] = round(pnl_pct_lev, 2)
+    worst_trade["pnl_usd"] = pnl_usd
+    worst_trade["status"] = "closed"
+    save_trades(data)
+
+    log(
+        f"换仓平仓 {worst_trade.get('id')} {worst_trade.get('symbol')} {direction} "
+        f"exit={worst_price:.6f} pnl={pnl_pct_lev:+.2f}% ({pnl_usd:+.2f}U)"
+    )
+    return execute_open(data, state, new_signal.get("symbol"), new_signal.get("price"), new_signal)
+
+
 def scan():
+    log("开始扫描 Bitget U 本位合约市场")
     data = load_trades()
     state = load_state()
 
@@ -751,19 +828,23 @@ def scan():
         for trade in open_trades
         if normalize_symbol(trade.get("symbol"))
     }
-    if len(open_trades) >= MAX_OPEN_POSITIONS:
-        log(f"当前开仓数已达上限 {len(open_trades)}/{MAX_OPEN_POSITIONS}，跳过扫描")
-        return
+    full_capacity = len(open_trades) >= MAX_OPEN_POSITIONS
+    if full_capacity:
+        log(f"当前开仓数已达上限 {len(open_trades)}/{MAX_OPEN_POSITIONS}，继续扫描，仅允许S级信号换仓")
+    else:
+        log(f"当前开仓数 {len(open_trades)}/{MAX_OPEN_POSITIONS}，可正常开新仓")
 
     tickers = get_all_tickers()
     if not tickers:
         log("获取ticker失败或为空，跳过扫描")
         return
+    log(f"已获取 ticker {len(tickers)} 个")
 
     funding_rates = get_funding_rates(tickers)
     if not funding_rates:
         log("获取资金费率失败或为空，跳过扫描")
         return
+    log(f"已获取资金费率 {len(funding_rates)} 个")
 
     ticker_map = {
         ticker.get("symbol"): ticker for ticker in tickers if isinstance(ticker, dict) and ticker.get("symbol")
@@ -801,10 +882,15 @@ def scan():
 
         candidates.append((normalized_symbol, ticker, quote_volume))
 
+    log(f"候选币种数量 {len(candidates)}")
+
     signals = []
     strength_rank = {"S": 0, "A": 1, "B": 2}
-    for symbol, ticker, quote_volume in candidates:
+    total_candidates = len(candidates)
+    for index, (symbol, ticker, quote_volume) in enumerate(candidates, start=1):
+        render_progress("分析候选币", index, total_candidates)
         funding_rate = funding_rates.get(symbol)
+        symbol_signals = []
 
         detectors = (
             lambda: detect_extreme_negative_funding(
@@ -839,13 +925,35 @@ def scan():
             enriched["symbol"] = symbol
             enriched["volume_m"] = quote_volume / 1e6
             signals.append(enriched)
+            symbol_signals.append(enriched)
+
+        if symbol_signals:
+            log(
+                f"{symbol} 命中信号: "
+                + ", ".join(f"{item.get('type')}[{item.get('strength')}]" for item in symbol_signals)
+            )
 
     if not signals:
         log("本轮未发现可执行信号")
         return
 
+    log(f"本轮共发现信号 {len(signals)} 个")
     signals.sort(key=lambda item: (strength_rank.get(item.get("strength"), 99), -item.get("volume_m", 0)))
     best_signal = signals[0]
+    log(
+        f"最强信号 {best_signal.get('symbol')} {best_signal.get('type')} "
+        f"strength={best_signal.get('strength')} reason={best_signal.get('reason', '')}"
+    )
+
+    if full_capacity:
+        if best_signal.get("strength") != "S":
+            log(f"满仓且最强信号不是S级，跳过执行 {best_signal.get('symbol')} {best_signal.get('type')}")
+            return
+        swapped_trade = swap_weakest(data, state, open_trades, best_signal, ticker_map)
+        if swapped_trade is None:
+            log(f"S级信号换仓失败或被放弃 {best_signal.get('symbol')} {best_signal.get('type')}")
+        return
+
     if best_signal.get("strength") == "B":
         log(
             f"最佳信号为B级，按策略跳过 {best_signal.get('symbol')} {best_signal.get('type')} "

@@ -383,6 +383,16 @@ def api_loss_samples():
     return stats
 
 
+@app.get("/api/recent-posts")
+def api_recent_posts(limit: int = 50):
+    with storage.get_conn() as conn:
+        posts = storage.recent_posts(conn, limit=max(1, min(limit, 200)))
+    return {
+        "items": posts,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 @app.get("/api/status")
 def api_status():
     """Worker 的当前状态（供前端进度面板显示）"""
@@ -765,6 +775,37 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 }
 .candidate-item.pass { border-left: 3px solid var(--green); }
 .candidate-item.wait { border-left: 3px solid var(--yellow); }
+.post-feed-window {
+  height: 180px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0a0e15;
+}
+.post-feed-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.post-feed-item {
+  padding: 8px 12px;
+  border-bottom: 1px solid #222836;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.post-feed-item:last-child {
+  border-bottom: none;
+}
+.post-feed-author {
+  color: var(--accent);
+  font-weight: 600;
+}
+.post-feed-tokens {
+  color: #7eb3ff;
+}
 </style>
 </head>
 <body>
@@ -858,6 +899,16 @@ tr.flash { animation: row-flash 1.5s ease-out; }
   </div>
   <div id="watchlist"><div class="empty">暂无观察代币。去下方榜单点击 ⭐ 加入。</div></div>
   <div id="loss-samples-stats" class="loss-samples-stats muted" style="margin-top:12px;font-size:12px;"></div>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">📰 已抓取帖子</h2>
+  <div class="muted" style="font-size:12px;margin-bottom:10px;">
+    单行滚动展示最近抓取到的帖子：发帖人 / 内容 / 涉及币种
+  </div>
+  <div class="post-feed-window">
+    <div id="post-feed" class="post-feed-scroll"><div class="empty">等待帖子数据...</div></div>
+  </div>
 </div>
 
 <div class="panel">
@@ -1258,10 +1309,11 @@ async function refreshAll(opts = {}) {
   btns.forEach(b => b.disabled = true);
 
   try {
-    const [lb, _, __] = await Promise.all([
+    const [lb, _, __, ___] = await Promise.all([
       fetch('/api/leaderboard').then(r => r.json()),
       loadWatchlist(),
       loadLossSamples(),
+      loadRecentPosts(),
     ]);
 
     // 渲染榜单前，先算出哪些代币变化了
@@ -1400,6 +1452,42 @@ async function loadLossSamples() {
   } catch (e) {
     // 静默
   }
+}
+
+async function loadRecentPosts() {
+  try {
+    const resp = await fetch('/api/recent-posts?limit=60');
+    const data = await resp.json();
+    const el = document.getElementById('post-feed');
+    if (!el) return;
+    if (!data.items || !data.items.length) {
+      el.innerHTML = '<div class="empty">暂无已抓取帖子</div>';
+      return;
+    }
+    el.innerHTML = data.items.map(item => {
+      const author = item.username || item.user_id || '未知用户';
+      const content = (item.content || '').replace(/\\s+/g, ' ').trim() || '（无内容）';
+      const tokens = (item.tokens || []).length ? item.tokens.join(', ') : '-';
+      const safeAuthor = escapeHtml(author);
+      const safeContent = escapeHtml(content);
+      const safeTokens = escapeHtml(tokens);
+      return `<div class="post-feed-item" title="${safeAuthor} | ${safeContent} | ${safeTokens}">`
+        + `<span class="post-feed-author">${safeAuthor}</span> · ${safeContent} · `
+        + `<span class="post-feed-tokens">${safeTokens}</span></div>`;
+    }).join('');
+  } catch (e) {
+    const el = document.getElementById('post-feed');
+    if (el) el.innerHTML = `<div class="empty">帖子加载失败：${e.message}</div>`;
+  }
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // === 自动交易面板 ===
@@ -1735,6 +1823,7 @@ refreshAll({ silent: true });
 pollWorkerStatus();
 setInterval(pollWatchlistRealtime, 1000);
 setInterval(loadTradingPanel, 3000);
+setInterval(loadRecentPosts, 5000);
 setInterval(() => refreshAll(), 30000);
 setInterval(pollWorkerStatus, 2000);  // worker 状态高频刷新
 </script>

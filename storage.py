@@ -353,6 +353,35 @@ def snapshot_get_all(conn) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+def recent_posts(conn, limit: int = 50) -> list[dict]:
+    cur = conn.execute("""
+        SELECT
+            p.post_id,
+            p.user_id,
+            p.content,
+            p.likes,
+            p.comments,
+            p.shares,
+            p.posted_at,
+            p.fetched_at,
+            a.username,
+            GROUP_CONCAT(m.token, ',') AS tokens
+        FROM posts p
+        LEFT JOIN authors a ON a.user_id = p.user_id
+        LEFT JOIN mentions m ON m.post_id = p.post_id
+        GROUP BY p.post_id
+        ORDER BY COALESCE(p.first_seen_at, p.fetched_at) DESC
+        LIMIT ?
+    """, (limit,))
+    rows = []
+    for row in cur.fetchall():
+        item = dict(row)
+        raw_tokens = item.get("tokens") or ""
+        item["tokens"] = [t for t in raw_tokens.split(",") if t]
+        rows.append(item)
+    return rows
+
+
 def realtime_upsert(conn, token: str, symbol: str, snapshot_json: str):
     conn.execute("""
         INSERT INTO market_realtime_cache (token, symbol, snapshot, updated_at)

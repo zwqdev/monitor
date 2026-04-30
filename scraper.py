@@ -10,9 +10,26 @@
 这样一轮能抓到的帖子比"打开-滚几十次-关闭"多几倍。
 """
 import asyncio
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _bootstrap_windows_runtime():
+    if os.name != "nt":
+        return
+    for candidate in (
+        Path("C:/Windows/System32"),
+        Path("C:/Users/zhangweiqiang/AppData/Roaming/uv/python/cpython-3.12-windows-x86_64-none"),
+        Path("C:/Windows/WinSxS/amd64_microsoft-edge-webview_31bf3856ad364e35_10.0.26100.8246_none_2ec91fd13ab0f039"),
+    ):
+        if candidate.exists():
+            os.add_dll_directory(str(candidate))
+
+
+_bootstrap_windows_runtime()
+
 from playwright.async_api import async_playwright, Response
 import config
 

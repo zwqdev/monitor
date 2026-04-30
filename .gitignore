@@ -41,6 +41,9 @@ logs/
 *.swo
 *~
 
+# =============== Git worktrees ===============
+.worktrees/
+
 # =============== 系统 ===============
 .DS_Store
 Thumbs.db
